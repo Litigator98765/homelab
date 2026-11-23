@@ -1,0 +1,8 @@
+# secrets
+.env
+# data folders
+immich/library/
+immich/postgres/
+portainer/data/
+jellyfin/config/
+jellyfin/cache/
