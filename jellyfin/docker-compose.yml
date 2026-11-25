@@ -1,0 +1,14 @@
+services:
+  jellyfin:
+    image: jellyfin/jellyfin:latest
+    container_name: jellyfin
+    user: 1000:1000
+    network_mode: host
+    volumes:
+      - ./config:/config
+      - ./cache:/cache
+      - ${MEDIA_DIR}:/media:ro
+    environment:
+      - TZ=America/New_York
+    mem_limit: 1g
+    restart: unless-stopped

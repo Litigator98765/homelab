@@ -3,9 +3,9 @@
 **Device:** Raspberry Pi 4 Model B Rev 1.5 · 4 GB RAM · Raspberry Pi OS 64-bit (aarch64)
 **Hostname / user:** `raspberrypi` / `litigator`
 **Home LAN IP:** `192.168.1.247` (reserve in router — Roku connects by IP)
-**Storage:** 64 GB microSD (temporary) → USB SSD (SanDisk ~600 MB/s, purchased, not yet installed)
+**Storage:** 64 GB microSD (OS only) + 1 TB SanDisk USB SSD at `/mnt/ssd` (Docker, compose projects, media, file share)
 **Repo:** github.com/Litigator98765/homelab (private) — config only, no secrets or data
-**Architecture diagram:** https://claude.ai/artifact/AEgivDoV5oMG81MUFcTyKf
+**Architecture:** [`architecture.md`](architecture.md) · **Rebuild:** [`rebuild.md`](rebuild.md)
 
 ---
 
@@ -139,20 +139,165 @@ services:
 
 ---
 
+
+## 2026-11-24
+
+### Storage plan changed: OS stays on the SD card, data moves to the SSD
+The original plan was to `rpi-clone` the SD card to the SSD and boot from it. Instead, the
+OS stays on the SD card so **the Pi always boots, even if the SSD is unplugged or fails**,
+and everything else lives on the SSD at `/mnt/ssd`.
+
+### SSD — formatted and mounted at `/mnt/ssd`
+- Reformatted as a single GPT partition `/dev/sda1`, **ext4**, label `ssd`.
+- Mount point protected so nothing can be written to the SD card by mistake when the SSD
+  isn't mounted:
+  ```bash
+  sudo mkdir -p /mnt/ssd
+  sudo chattr +i /mnt/ssd          # immutable while EMPTY → writes fail instead of filling the SD card
+  ```
+- Mounted by UUID in `/etc/fstab` (backup at `/etc/fstab.bak`):
+  ```
+  UUID=<ssd-uuid>  /mnt/ssd  ext4  defaults,noatime,nofail,x-systemd.device-timeout=10s  0  2
+  ```
+  `noatime` = don't write "last read" times · `nofail` = boot continues without the SSD ·
+  `x-systemd.device-timeout=10s` = only wait 10 s for it · `2` = fsck it after the root FS.
+- After mounting: `sudo chown litigator:litigator /mnt/ssd`.
+
+### Docker + containerd data moved to the SSD
+Docker 29 uses the **containerd image store** (`docker info` → driver `overlayfs`), so images
+live under containerd, not Docker — **both** had to move.
+
+```bash
+# Docker
+echo '{ "data-root": "/mnt/ssd/docker" }' | sudo tee /etc/docker/daemon.json
+
+# containerd (backup: /etc/containerd/config.toml.bak) — inserted as line 1:
+#   root = "/mnt/ssd/containerd"
+
+# Don't start either service until the SSD is mounted
+for s in docker containerd; do
+  sudo mkdir -p /etc/systemd/system/$s.service.d
+  printf '[Unit]\nRequiresMountsFor=/mnt/ssd\n' | sudo tee /etc/systemd/system/$s.service.d/ssd.conf
+done
+sudo systemctl daemon-reload
+```
+- Verified: `docker info` → Docker Root Dir `/mnt/ssd/docker`; containerd root `/mnt/ssd/containerd`;
+  images, containers and Portainer all OK.
+- containerd logs a harmless "migrated from version 0" config warning.
+- Swap is zram (in RAM) — nothing to move.
+
+### Compose projects + media moved to the SSD
+This repo moved from `~/docker` to **`/mnt/ssd/compose`**, and media from `~/media` to
+**`/mnt/ssd/media`**.
+
+```bash
+# 1. Stop everything (from the old folders)
+cd ~/docker/portainer && docker compose down
+cd ~/docker/jellyfin  && docker compose down
+cd ~/docker/immich    && docker compose down
+
+# 2. Copy, keeping owners, permissions, hard links, ACLs and xattrs
+sudo rsync -aHAX --info=progress2 /home/litigator/docker/ /mnt/ssd/compose/
+sudo rsync -aHAX --info=progress2 /home/litigator/media/  /mnt/ssd/media/
+
+# 3. Jellyfin was the only project with an absolute path
+sed -i 's|^MEDIA_DIR=.*|MEDIA_DIR=/mnt/ssd/media|' /mnt/ssd/compose/jellyfin/.env
+
+# 4. Start from the new location (same folder names → same compose project names)
+cd /mnt/ssd/compose/portainer && docker compose up -d
+cd /mnt/ssd/compose/jellyfin  && docker compose up -d
+cd /mnt/ssd/compose/immich    && docker compose up -d
+```
+- Immich (`./library`, `./postgres`) and Portainer (`./data`) use relative paths → no edits.
+- Jellyfin's container-side path is still `/media`, so its libraries didn't change.
+- Check every container runs from the SSD:
+  ```bash
+  docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Label "com.docker.compose.project.working_dir"}}'
+  ```
+- **Gotchas:** files owned by container users need `sudo` for `rsync`/`du`. If a container
+  gets started from the old folder by mistake: stop it, re-sync with `rsync -aHAX --delete`,
+  then start it from `/mnt/ssd/compose`.
+
+### Beszel — system monitoring
+Lightweight dashboard with history for the whole Pi (CPU, RAM, temperature, network, SD card
+and SSD) and per-container stats. Chosen over Grafana + Prometheus (too heavy next to
+Immich + Jellyfin on 4 GB) and Glances (no history).
+
+```bash
+mkdir -p /mnt/ssd/compose/beszel /mnt/ssd/.beszel
+cd /mnt/ssd/compose/beszel
+# wrote docker-compose.yml (see beszel/docker-compose.yml in this repo)
+docker compose up -d beszel       # hub only first — the agent needs a key + token from it
+```
+- Hub: `http://raspberrypi.local:8090` → created admin account → **Add System**:
+  name `raspberrypi`, Host/IP `/beszel_socket/beszel.sock`; copied the Public Key + Token
+  into the agent's `KEY` / `TOKEN` (values keep their quotes), then `docker compose up -d`.
+- Hub and agent talk over a **unix socket** in `./beszel_socket` — no agent port on the network.
+- Agent runs `network_mode: host` (sees the Pi's real network traffic) and reads
+  `docker.sock` read-only for container stats.
+- SSD monitoring: an empty marker folder on the SSD is mounted at
+  `/extra-filesystems/sda1__SSD` (`sda1` = device for I/O stats, `SSD` = chart label).
+  The SD card is the root filesystem and is monitored automatically.
+
+### Samba — file share from Windows
+Installed **on the host**, not in Docker: keeps working if Docker breaks, and files are owned
+by the real `litigator` user (same UID 1000 that Jellyfin runs as).
+
+```bash
+sudo apt install samba -y
+mkdir /mnt/ssd/share
+sudo smbpasswd -a litigator       # Samba has its own password list
+```
+Share block at the bottom of `/etc/samba/smb.conf` (replaced the Ubuntu guide's
+`[sambashare]`, whose `path = /home/username/sambashare` placeholder was never filled in):
+```ini
+[share]
+   comment = Pi SSD share
+   path = /mnt/ssd/share
+   read only = no
+   valid users = litigator
+```
+```bash
+testparm -s                       # check config
+sudo systemctl restart smbd
+systemctl is-enabled smbd         # enabled → starts at boot
+
+# Wait for the SSD before starting
+sudo mkdir -p /etc/systemd/system/smbd.service.d
+printf '[Unit]\nRequiresMountsFor=/mnt/ssd\n' | sudo tee /etc/systemd/system/smbd.service.d/ssd.conf
+sudo systemctl daemon-reload
+```
+- Windows: `\\raspberrypi.local\share`, user `litigator` + Samba password.
+- To drop movies in from Windows, add a second `[media]` block with `path = /mnt/ssd/media`.
+- **Never share** `/mnt/ssd/docker`, `/mnt/ssd/containerd` or `/mnt/ssd/compose`
+  (Docker data, Immich's database, `.env` passwords).
+
+### Issue — SSH from the laptop stopped working
+- Cause: home Wi-Fi dropped and the laptop silently fell back to the iPhone hotspot
+  (`172.20.10.x`), a different network from the Pi.
+- Fix: reconnect the laptop to home Wi-Fi. Longer term: DHCP reservation, Tailscale on the
+  laptop (work laptop may block it), or a lower-priority fallback Wi-Fi profile on the Pi
+  via `nmcli`.
+
+---
+
 ## Open items
-- [ ] Confirm `docker stats` shows real memory after reboot
+- [ ] Delete old copies after a few days of everything working:
+      `/var/lib/docker.old`, `/var/lib/containerd.old`, `~/docker.old`, `~/media.old`
+      (confirm the renames were done first). Optional: `ln -s /mnt/ssd/compose ~/docker`
+- [ ] Journald size cap: `SystemMaxUse=50M` in `/etc/systemd/journald.conf` (unconfirmed)
+- [ ] Reboot test: all containers + `smbd` come back with no manual steps
+- [ ] Immich: re-enable Machine Learning (now on the SSD), run Smart Search + Face Detection on "Missing"
 - [ ] Immich: set job concurrency to 1 (Thumbnails, Smart Search, Face Detection, Video Conversion)
 - [ ] Immich app: Settings → Networking → automatic URL switching (local + Tailscale)
-- [ ] Tailscale admin console: **Disable key expiry** on the Pi
+- [ ] Beszel: set up alerts (disk space, temperature, system down)
+- [ ] Tailscale admin console: **Disable key expiry** on the Pi; remove the Pi from the wrong-email account
 - [ ] Tailscale on phone: VPN On Demand (iOS) / Always-on VPN (Android)
-- [ ] Add `setup-host.sh` + README to repo; commit this log
-- [ ] Optional: boot to console instead of desktop (`raspi-config`) to free RAM
-- [ ] Remove the Pi from the wrong-email Tailscale account
 - [ ] Router: DHCP reservation for the Pi at 192.168.1.247
-- [ ] Commit Jellyfin config: `git add jellyfin && git commit -m "Add Jellyfin" && git push`
+- [ ] Optional: boot to console instead of desktop (`raspi-config`) to free RAM
 
 ## Next up
-1. **SSD arrives:** `lsblk` → `rpi-clone sda` → remove SD → boot from SSD
-2. Re-enable Immich ML, run Smart Search + Face Detection jobs on "Missing"; turn on full phone backup
-3. Photo backup: second drive and/or Backblaze B2
-4. Media drive for Jellyfin (powered external HDD or SSD); point `MEDIA_DIR` at it
+1. Full phone photo backup into Immich
+2. Off-site photo backup: AWS S3 Glacier Deep Archive (bucket created, `us-east-2`)
+3. Samba `[media]` share if copying movies in from Windows
+4. Optional: Tailscale on the laptop, hotspot fallback Wi-Fi on the Pi
