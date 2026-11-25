@@ -6,3 +6,7 @@ immich/postgres/
 portainer/data/
 jellyfin/config/
 jellyfin/cache/
+beszel/beszel_data/
+beszel/beszel_agent_data/
+beszel/beszel_socket/
+beszel/ssd/
